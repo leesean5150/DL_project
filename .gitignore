@@ -210,3 +210,4 @@ ieee-fraud-detection
 data/ieee_fraud_sequences_full_embeddings.jsonl
 data/ieee_fraud_sequences_full_embeddings.jsonl.zip
 .DS_Store
+data/processed_fraud

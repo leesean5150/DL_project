@@ -1,118 +1,168 @@
 import json
-from typing import List, Dict, Optional, Any
+from pathlib import Path
+from typing import Dict, Any, Optional
+
+import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+PREPROCESSED_DIRECTORY_PATH = "data/processed_fraud" 
 
 class TransactionDataset(Dataset):
     def __init__(
         self,
-        jsonl_path: str,
+        processed_dir: str,
         seq_len: int = 8,
-        feature_keys: Optional[List[str]] = None,
-        label_key: str = "isFraud",
-        encoder=None,
-        sort_key: Optional[str] = None,
+        split: Optional[str] = None,   # "train", "test" and "val" sets (Use those strings as the maps of how to split). 
+        label_dtype: torch.dtype = torch.float32, # we preprocessed so everything should be using floats
     ):
+        self.processed_dir = Path(processed_dir)
         self.seq_len = seq_len
-        self.label_key = label_key
-        self.feature_keys = feature_keys or []
-        self.samples = []
-        self.encoder = encoder
+        self.label_dtype = label_dtype
+        self.split = split
 
-        with open(jsonl_path, "r", encoding="utf-8") as f:
-            for line in f:
-                record = json.loads(line)
-                uid = record["UID"]
-                transactions = record["transactions"]
+        # Load our Metadata
+        with open(self.processed_dir / "metadata.json", "r", encoding="utf-8") as f:
+            self.metadata = json.load(f)
 
-                if not transactions:
-                    continue
+        with open(self.processed_dir / "feature_keys.json", "r", encoding="utf-8") as f:
+            self.feature_keys = json.load(f)
 
-                if sort_key is not None:
-                    transactions = sorted(
-                        transactions,
-                        key=lambda x: x.get(sort_key, 0)
-                    )
+        with open(self.processed_dir / "uids.json", "r", encoding="utf-8") as f:
+            self.uids = json.load(f)
 
-                for i in range(len(transactions)):
-                    if self.label_key not in transactions[i]:
-                        raise KeyError(
-                            f"Missing label key '{self.label_key}' for uid={uid}, idx={i}"
-                        )
+        # Load arrays
+        self.features = np.load(self.processed_dir / "features.npy", mmap_mode="r")
+        self.labels = np.load(self.processed_dir / "labels.npy", mmap_mode="r")
+        self.seq_lengths = np.load(self.processed_dir / "seq_lengths.npy", mmap_mode="r")
 
-                    start = max(0, i - self.seq_len + 1)
-                    window = transactions[start:i + 1]
+        self.num_transactions = int(self.metadata["num_transactions"])
+        self.feature_dim = int(self.metadata["feature_dim"])
+        self.num_uids = int(self.metadata["num_uids"])
 
-                    feature_window = []
-                    for txn in window:
-                        txn_cpy = dict(txn)
-                        txn_cpy.pop(self.label_key, None)
-                        feature_window.append(txn_cpy)
+        # Basic consistency checks
+        if self.features.shape != (self.num_transactions, self.feature_dim):
+            raise ValueError(
+                f"features.npy shape mismatch: expected {(self.num_transactions, self.feature_dim)}, "
+                f"got {self.features.shape}"
+            )
 
-                    self.samples.append({
-                        "uid": uid,
-                        "window": feature_window,
-                        "label": transactions[i][self.label_key],
-                    })
+        if self.labels.shape != (self.num_transactions,):
+            raise ValueError(
+                f"labels.npy shape mismatch: expected {(self.num_transactions,)}, got {self.labels.shape}"
+            )
 
-    def __len__(self):
-        return len(self.samples)
+        if self.seq_lengths.shape != (self.num_uids,):
+            raise ValueError(
+                f"seq_lengths.npy shape mismatch: expected {(self.num_uids,)}, got {self.seq_lengths.shape}"
+            )
 
-    def _encode_transaction(self, transaction: Dict[str, Any]):
-        if self.encoder is not None:
-            encoded = self.encoder.encode(transaction)
+        if len(self.uids) != self.num_uids:
+            raise ValueError(
+                f"uids.json length mismatch: expected {self.num_uids}, got {len(self.uids)}"
+            )
 
-            if isinstance(encoded, torch.Tensor):
-                encoded = encoded.detach().cpu().flatten().tolist()
-
-            if not isinstance(encoded, list):
-                raise TypeError(
-                    f"Encoder must return list or 1D torch.Tensor, got {type(encoded)}"
-                )
-
-            return encoded
-
-        features = []
-        for key in self.feature_keys:
-            value = transaction.get(key, 0.0)
-
-            if value is None:
-                value = 0.0
-
-            if isinstance(value, (int, float)):
-                features.append(float(value))
-            else:
-                features.append(0.0)
-
-        return features
-
-    def __getitem__(self, idx: int):
-        sample = self.samples[idx]
-        window = sample["window"]
-
-        encoded_window = [self._encode_transaction(txn) for txn in window]
-
-        if len(encoded_window) == 0:
-            raise ValueError(f"Empty encoded window at idx={idx}")
-
-        feature_dim = len(encoded_window[0])
-        pad_len = self.seq_len - len(encoded_window)
-
-        if pad_len > 0:
-            padding = [[0.0] * feature_dim for _ in range(pad_len)]
-            encoded_window = padding + encoded_window
-
-        x = torch.tensor(encoded_window, dtype=torch.float32)
-        y = torch.tensor(sample["label"], dtype=torch.float32)
-        attention_mask = torch.tensor(
-            [0] * pad_len + [1] * len(window),
-            dtype=torch.bool
+        # Rebuild UID segments
+        # Example:
+        # seq_lengths = [1, 5, 1]
+        # uid_starts  = [0, 1, 6]
+        # uid_ends    = [1, 6, 7]   (exclusive)
+        self.uid_starts = np.cumsum(
+            np.concatenate([np.array([0], dtype=np.int64), self.seq_lengths[:-1]])
         )
+        self.uid_ends = self.uid_starts + self.seq_lengths
+
+        # Build sample indices for split
+        self.sample_indices = self._build_sample_indices(split)
+
+    def _build_sample_indices(self, split: Optional[str]) -> np.ndarray:
+        if split is None:
+            return np.arange(self.num_transactions, dtype=np.int64)
+
+        split_map = {
+            "train": "train_uid_indices.npy",
+            "val": "val_uid_indices.npy",
+            "test": "test_uid_indices.npy",
+        }
+
+        if split not in split_map:
+            raise ValueError(f"split must be one of {list(split_map.keys())} or None, got {split}")
+
+        uid_indices = np.load(self.processed_dir / split_map[split])
+
+        txn_ranges = []
+        for uid_idx in uid_indices:
+            uid_idx = int(uid_idx)
+            start = int(self.uid_starts[uid_idx])
+            end = int(self.uid_ends[uid_idx])
+            txn_ranges.append(np.arange(start, end, dtype=np.int64))
+
+        if not txn_ranges:
+            return np.empty((0,), dtype=np.int64)
+
+        return np.concatenate(txn_ranges)
+
+    # Note:
+    # Splits are performed at the UID level to avoid leakage, but each transaction
+    # still becomes one training sample. Therefore dataset length is the number of
+    # transactions/windows in the selected split, not the number of UID sequences.
+    # A UID with T transactions contributes T rolling-window samples. Which is basically the same as the number of actual transactions:
+    # Example: Given a sequence S of 3 transactions: [T1, T2 , T3] we make a rollign window of:
+    # S_1 => [T1, T2, T3] 
+    # S_2 => [T2, T3]
+    # S_3 => [T3] 
+    # The number of sequences generated is equal to the number of transactions
+    def __len__(self) -> int:
+        return len(self.sample_indices)
+
+    def _locate_uid_idx(self, global_txn_idx: int) -> int:
+        """
+        Find which UID segment contains this global transaction index.
+        uid_ends is exclusive, so searchsorted(..., side='right') works well.
+        """
+        return int(np.searchsorted(self.uid_ends, global_txn_idx, side="right"))
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        if idx < 0 or idx >= len(self):
+            raise IndexError(f"Index {idx} out of range for dataset of size {len(self)}")
+
+        # Map split-local sample index -> original global transaction index
+        global_txn_idx = int(self.sample_indices[idx])
+
+        # Find owning UID segment
+        uid_idx = self._locate_uid_idx(global_txn_idx)
+        uid = self.uids[uid_idx]
+
+        seq_start = int(self.uid_starts[uid_idx])
+        seq_end = int(self.uid_ends[uid_idx])  # exclusive, not used directly here
+
+        # Build rolling history window ending at global_txn_idx
+        window_start = max(seq_start, global_txn_idx - self.seq_len + 1)
+        window_end = global_txn_idx + 1
+
+        window = self.features[window_start:window_end]  # shape [L, F]
+        actual_len = window.shape[0]
+        pad_len = self.seq_len - actual_len
+
+        if actual_len <= 0:
+            raise ValueError(
+                f"Empty window encountered for idx={idx}, global_txn_idx={global_txn_idx}, uid={uid}"
+            )
+
+        # Left pad with zeros (we left pad because we want the final value in the sequence to be the thing we predict)
+        # For example if we had a transaction sequence of 3 it would look like::
+        # S = [PAD, PAD, PAD, T1, T2, T3] <- this way T3 which is the thing we want to predict is the last value in the sequence
+        x = np.zeros((self.seq_len, self.feature_dim), dtype=np.float32)
+        x[pad_len:] = window
+
+        attention_mask = np.zeros((self.seq_len,), dtype=np.bool_)
+        attention_mask[pad_len:] = True
+
+        y = self.labels[global_txn_idx]
 
         return {
-            "x": x,
-            "attention_mask": attention_mask,
-            "y": y,
-            "uid": sample["uid"],
+            "x": torch.from_numpy(x),
+            "attention_mask": torch.from_numpy(attention_mask),
+            "y": torch.tensor(y, dtype=self.label_dtype),
+            "uid": uid,
         }
