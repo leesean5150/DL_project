@@ -75,6 +75,7 @@ class TransactionDataset(Dataset):
         # Build sample indices for split
         self.sample_indices = self._build_sample_indices(split)
 
+    # We need to ensure that this maintains the split dsitributions (We tested using seed 100 and they seem fairly even for all so we should be in the clear.)
     def _build_sample_indices(self, split: Optional[str]) -> np.ndarray:
         if split is None:
             return np.arange(self.num_transactions, dtype=np.int64)

@@ -250,6 +250,96 @@ def test_dataloader_batch():
 
     print("PASS\n")
 
+def summarize_split_distribution(name: str, uid_indices: np.ndarray):
+    labels = np.load(PROCESSED_DIR / "labels.npy", mmap_mode="r")
+    seq_lengths = np.load(PROCESSED_DIR / "seq_lengths.npy", mmap_mode="r")
+
+    uid_starts = np.cumsum(
+        np.concatenate([np.array([0], dtype=np.int64), seq_lengths[:-1]])
+    )
+    uid_ends = uid_starts + seq_lengths
+
+    total_uids = len(uid_indices)
+    total_txns = 0
+    fraud_txns = 0
+    fraud_uids = 0
+
+    for uid_idx in uid_indices:
+        uid_idx = int(uid_idx)
+        start = int(uid_starts[uid_idx])
+        end = int(uid_ends[uid_idx])
+
+        split_labels = labels[start:end]
+        total_txns += len(split_labels)
+
+        split_fraud_txns = int(np.sum(split_labels))
+        fraud_txns += split_fraud_txns
+
+        if split_fraud_txns > 0:
+            fraud_uids += 1
+
+    txn_fraud_rate = fraud_txns / total_txns if total_txns > 0 else 0.0
+    uid_fraud_rate = fraud_uids / total_uids if total_uids > 0 else 0.0
+
+    print(f"=== {name} DISTRIBUTION ===")
+    print(f"UIDs                    : {total_uids}")
+    print(f"Transactions            : {total_txns}")
+    print(f"Fraud transactions      : {fraud_txns}")
+    print(f"Transaction fraud rate  : {txn_fraud_rate:.6f}")
+    print(f"UIDs with >=1 fraud txn : {fraud_uids}")
+    print(f"UID fraud-presence rate : {uid_fraud_rate:.6f}")
+    print()
+
+    return {
+        "total_uids": total_uids,
+        "total_txns": total_txns,
+        "fraud_txns": fraud_txns,
+        "txn_fraud_rate": txn_fraud_rate,
+        "fraud_uids": fraud_uids,
+        "uid_fraud_rate": uid_fraud_rate,
+    }
+
+def test_split_class_distribution():
+    print("=== test_split_class_distribution ===")
+
+    train_uid_idx = np.load(PROCESSED_DIR / "train_uid_indices.npy")
+    val_uid_idx = np.load(PROCESSED_DIR / "val_uid_indices.npy")
+    test_uid_idx = np.load(PROCESSED_DIR / "test_uid_indices.npy")
+
+    train_stats = summarize_split_distribution("TRAIN", train_uid_idx)
+    val_stats = summarize_split_distribution("VAL", val_uid_idx)
+    test_stats = summarize_split_distribution("TEST", test_uid_idx)
+
+    # Soft sanity checks: these are not strict equality checks.
+    # We just want to catch obviously skewed splits.
+    txn_rates = np.array([
+        train_stats["txn_fraud_rate"],
+        val_stats["txn_fraud_rate"],
+        test_stats["txn_fraud_rate"],
+    ])
+
+    uid_rates = np.array([
+        train_stats["uid_fraud_rate"],
+        val_stats["uid_fraud_rate"],
+        test_stats["uid_fraud_rate"],
+    ])
+
+    txn_rate_range = txn_rates.max() - txn_rates.min()
+    uid_rate_range = uid_rates.max() - uid_rates.min()
+
+    print(f"Transaction fraud rate range : {txn_rate_range:.6f}")
+    print(f"UID fraud-presence rate range: {uid_rate_range:.6f}")
+
+    # These thresholds are heuristics, not hard mathematical rules.
+    # Tight enough to catch a badly skewed random split, loose enough to avoid false alarms.
+    assert txn_rate_range < 0.01, (
+        f"Transaction-level fraud rates differ too much across splits: {txn_rates}"
+    )
+    assert uid_rate_range < 0.02, (
+        f"UID-level fraud-presence rates differ too much across splits: {uid_rates}"
+    )
+
+    print("PASS\n")
 
 def main():
     print("Running TransactionDataset tests...\n")
@@ -262,6 +352,7 @@ def main():
     test_first_transaction_padding()
     test_window_boundary_respect()
     test_dataloader_batch()
+    test_split_class_distribution()
 
     print("All tests passed!")
 

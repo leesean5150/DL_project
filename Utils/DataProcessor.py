@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
+EXCLUDED_FEATURE_KEYS = {"TransactionID"}
 
 def _coerce_to_float(value: Any) -> float:
     if value is None:
@@ -219,10 +220,11 @@ def preprocess_jsonl_to_disk(
 
                 for txn in transactions:
                     for k in txn.keys():
-                        if k != label_key:
+                        if k != label_key and (k not in EXCLUDED_FEATURE_KEYS):
                             inferred_keys.add(k)
 
         feature_keys = sorted(inferred_keys)
+        feature_keys = [k for k in feature_keys if k not in EXCLUDED_FEATURE_KEYS]
 
     if not feature_keys:
         raise ValueError("No feature keys found.")

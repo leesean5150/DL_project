@@ -1,9 +1,9 @@
 import torch
 import torch.nn as nn
 
-# B: batch size (TBD), S: seq len (8), F: feature dim (112)
+# B: batch size (TBD), S: seq len (8), F: feature dim (111)
 # Our dataset will give us tensors of shape:
-# x: (B, S, F) -- B number of Seqences of len S(8) each containing feature dimension of F(112)
+# x: (B, S, F) -- B number of Seqences of len S(8) each containing feature dimension of F(111)
 # attention mask:  (B, S) -- B number of boolean masks of length S (8)
 # y: (B) -- B number of a single label
 
@@ -52,7 +52,7 @@ import torch.nn as nn
 class TransformerFraudModel(nn.Module):
     def __init__(
         self,
-        feature_dim: int = 112,
+        feature_dim: int = 111,
         seq_len: int = 8,
         d_model: int = 64,
         nhead: int = 4,
@@ -178,7 +178,7 @@ class LastTokenMLP(nn.Module):
 
     def __init__(
         self,
-        feature_dim: int = 112,
+        feature_dim: int = 111,
         hidden_dim: int = 64,
         dropout: float = 0.1,
     ):

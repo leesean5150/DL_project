@@ -19,7 +19,7 @@ x = sample["x"].unsqueeze(0)  # (1, 8, 112)
 attention_mask = sample["attention_mask"].unsqueeze(0)  # (1, 8)
 
 model = TransformerFraudModel(
-    feature_dim=112,
+    feature_dim=111,
     seq_len=8,
     d_model=64,
     nhead=4,

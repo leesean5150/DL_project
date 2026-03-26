@@ -1,7 +1,9 @@
 import numpy as np
 import json
 
+
 # These are relative paths so run this in root.
+print("[UNNORMALIZED]=================================")
 features = np.load("data/processed_fraud/features.npy", mmap_mode="r")
 labels = np.load("data/processed_fraud/labels.npy", mmap_mode="r")
 seq_lengths = np.load("data/processed_fraud/seq_lengths.npy", mmap_mode="r")
@@ -45,3 +47,26 @@ print(features.min(), features.max())   # Ensuring that no nans
 
 print([k for k in feature_keys if k.endswith("_missing")])
 print([k for k in feature_keys if k.endswith("_present")])
+
+try:
+    print("[NORMALIZED]=================================")
+    features = np.load("data/processed_fraud_normalized/features.npy", mmap_mode="r")
+    labels = np.load("data/processed_fraud_normalized/labels.npy", mmap_mode="r")
+    seq_lengths = np.load("data/processed_fraud_normalized/seq_lengths.npy", mmap_mode="r")
+    with open("data/processed_fraud_normalized/feature_keys.json", "r", encoding="utf-8") as f:
+        feature_keys = json.load(f)
+
+    print(features[:10])                    # just quick inspection of features
+    print(features.shape)                   # Should be (590540, 98)
+    print(labels.shape)                     # (590540,)
+    print(seq_lengths.shape)                # (217850,)
+    print(seq_lengths[:10])                 # Just for our our own inspection
+    print(features.min(), features.max())   # Ensuring that no nans
+
+    print([k for k in feature_keys if k.endswith("_missing")])
+    print([k for k in feature_keys if k.endswith("_present")])
+    for k in ["ProductCD", "card4", "M1"]:
+        idx = feature_keys.index(k)
+        print(k, features[:10, idx])
+except Exception as e:
+    print("Normalised set not created yet.")
