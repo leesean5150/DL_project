@@ -125,28 +125,28 @@ def compute_binary_classification_metrics(
 # CHECKPOINTING HELPERS
 
 def save_checkpoint(
-    checkpoint_path: str,
-    model: torch.nn.Module,
-    optimizer: torch.optim.Optimizer,
-    epoch: int,
-    history: Dict[str, list],
-    best_metric: float,
-    scheduler: Optional[Any] = None,
-    extra: Optional[Dict[str, Any]] = None) -> None:
-    ckp_path = Path(checkpoint_path)
-    ckp_path.parent.mkdir(parents=True, exist_ok=True)
-
-    payload = {
+    checkpoint_path,
+    model,
+    optimizer,
+    scheduler,
+    criterion,
+    epoch,
+    best_metric,
+    history,
+    extra=None,
+):
+    checkpoint = {
         "epoch": epoch,
         "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict() if optimizer is not None else None,
         "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
-        "history": history,
+        "criterion_class": criterion.__class__.__name__ if criterion is not None else None,
         "best_metric": best_metric,
-        "extra": extra or {},        
+        "history": history,
+        "extra": extra or {},
     }
 
-    torch.save(payload, ckp_path)
+    torch.save(checkpoint, checkpoint_path)
 
 def load_checkpoint(
     checkpoint_path: str,
@@ -195,6 +195,11 @@ def train_one_epoch(
         logits = model(x, attention_mask)
         loss = criterion(logits, y)
 
+        if hasattr(model, "get_aux_loss"):
+            aux_loss = model.get_aux_loss()
+            if aux_loss is not None:
+                loss = loss + aux_loss
+
         loss.backward()
 
         if max_grad_norm is not None:
@@ -241,6 +246,11 @@ def evaluate_model(
 
         logits = model(x, attention_mask)
         loss = criterion(logits, y)
+
+        if hasattr(model, "get_aux_loss"):
+            aux_loss = model.get_aux_loss()
+            if aux_loss is not None:
+                loss = loss + aux_loss
 
         batch_size = y.size(0)
         running_loss += float(loss.item()) * batch_size
@@ -296,6 +306,7 @@ def _maybe_print_overfitting_warning(
             f"gap={current_gap:.4f}"
         )
 
+
 def train_model(
     model: torch.nn.Module,
     train_loader: DataLoader,
@@ -304,62 +315,79 @@ def train_model(
     num_epochs: int = 10,
     lr: float = 1e-3,
     weight_decay: float = 1e-4,
+    optimizer: Optional[torch.optim.Optimizer] = None,
+    scheduler: Optional[Any] = None,
+    criterion: Optional[torch.nn.Module] = None,
     checkpoint_dir: str = "checkpoints/default_run",
     monitor: str = "val_pr_auc",
     monitor_mode: str = "max",
-    scheduler: Optional[Any] = None,
     use_pos_weight: bool = True,
     max_grad_norm: Optional[float] = 1.0,
     early_stopping_patience: Optional[int] = 5,
-    save_last: bool = True,
     extra_checkpoint_info: Optional[Dict[str, Any]] = None,
-    metric_threshold: float = 0.5
+    metric_threshold: float = 0.5,
 ) -> Dict[str, Any]:
     model = model.to(device)
-
-    # change if we want but have faith in the adam
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=lr,
-        weight_decay=weight_decay,
-    )
-
-    if use_pos_weight:
-        pos_weight = compute_pos_weight_from_loader(train_loader).to(device)
-        print(f"[info] Using pos_weight={float(pos_weight.item()):.4f}")
-        criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-    else:
-        criterion = torch.nn.BCEWithLogitsLoss()
-
     checkpoint_dir = Path(checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    # -------------------------------------------------
+    # Optimizer
+    # -------------------------------------------------
+    if optimizer is None:
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=lr,
+            weight_decay=weight_decay,
+        )
+        print("[info] Using default AdamW optimizer from train_model")
+    else:
+        print(f"[info] Using externally supplied optimizer: {optimizer.__class__.__name__}")
+
+    # -------------------------------------------------
+    # Criterion
+    # -------------------------------------------------
+    if criterion is None:
+        if use_pos_weight:
+            pos_weight = compute_pos_weight_from_loader(train_loader)
+            pos_weight = pos_weight.to(device)
+            print(f"[info] Using pos_weight={pos_weight.item():.4f}")
+            criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+        else:
+            criterion = torch.nn.BCEWithLogitsLoss()
+        print(f"[info] Using default criterion: {criterion.__class__.__name__}")
+    else:
+        print(f"[info] Using externally supplied criterion: {criterion.__class__.__name__}")
 
     history = {
         "train_loss": [],
         "val_loss": [],
-        "train_roc_auc": [],
-        "val_roc_auc": [],
         "train_pr_auc": [],
         "val_pr_auc": [],
-        "train_precision": [],
-        "val_precision": [],
-        "train_recall": [],
-        "val_recall": [],
+        "train_roc_auc": [],
+        "val_roc_auc": [],
         "train_f1": [],
         "val_f1": [],
         "train_f2": [],
         "val_f2": [],
+        "train_recall": [],
+        "val_recall": [],
+        "train_precision": [],
+        "val_precision": [],
+        "train_acc": [],
+        "val_acc": [],
         "lr": [],
-        "epoch_time_sec": [],
     }
 
-    best_metric = -float("inf") if monitor_mode == "max" else float("inf")
+    if monitor_mode not in {"max", "min"}:
+        raise ValueError("monitor_mode must be either 'max' or 'min'")
+
+    best_metric = float("-inf") if monitor_mode == "max" else float("inf")
     best_epoch = -1
-    epochs_without_improvement = 0
+    epochs_since_improvement = 0
 
-    for epoch in range(1, num_epochs + 1):
-        epoch_start = time.time()
-
+    for epoch in range(num_epochs):
+        epoch_start_time = time.time()
         train_metrics = train_one_epoch(
             model=model,
             loader=train_loader,
@@ -367,7 +395,7 @@ def train_model(
             criterion=criterion,
             device=device,
             max_grad_norm=max_grad_norm,
-            metric_threshold=metric_threshold
+            metric_threshold=metric_threshold,
         )
 
         val_metrics = evaluate_model(
@@ -375,11 +403,32 @@ def train_model(
             loader=val_loader,
             criterion=criterion,
             device=device,
-            metric_threshold=metric_threshold
+            metric_threshold=metric_threshold,
         )
+        epoch_time = time.time() - epoch_start_time
 
-        # Monitor logic
-        current_monitor_value = {
+        history["train_loss"].append(train_metrics["loss"])
+        history["val_loss"].append(val_metrics["loss"])
+        history["train_pr_auc"].append(train_metrics["pr_auc"])
+        history["val_pr_auc"].append(val_metrics["pr_auc"])
+        history["train_roc_auc"].append(train_metrics["roc_auc"])
+        history["val_roc_auc"].append(val_metrics["roc_auc"])
+        history["train_f1"].append(train_metrics["f1"])
+        history["val_f1"].append(val_metrics["f1"])
+        history["train_f2"].append(train_metrics["f2"])
+        history["val_f2"].append(val_metrics["f2"])
+        history["train_recall"].append(train_metrics["recall"])
+        history["val_recall"].append(val_metrics["recall"])
+        history["train_precision"].append(train_metrics["precision"])
+        history["val_precision"].append(val_metrics["precision"])
+        history["train_acc"].append(train_metrics["accuracy"])
+        history["val_acc"].append(val_metrics["accuracy"])
+
+        current_lrs = [group["lr"] for group in optimizer.param_groups]
+        current_lr = float(current_lrs[0])
+        history["lr"].append(current_lr)
+
+        available_monitors = {
             "train_loss": train_metrics["loss"],
             "val_loss": val_metrics["loss"],
             "train_pr_auc": train_metrics["pr_auc"],
@@ -393,108 +442,56 @@ def train_model(
             "train_recall": train_metrics["recall"],
             "val_recall": val_metrics["recall"],
             "train_precision": train_metrics["precision"],
-            "val_precision": val_metrics["precision"]
-        }.get(monitor)
+            "val_precision": val_metrics["precision"],
+        }
 
+        current_monitor_value = available_monitors.get(monitor)
         if current_monitor_value is None:
             raise ValueError(f"Unsupported monitor metric: {monitor}")
 
         if scheduler is not None:
-            # updated just in case we need to perform ablation
             if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
                 scheduler.step(current_monitor_value)
             else:
                 scheduler.step()
 
-        current_lr = optimizer.param_groups[0]["lr"]
-        epoch_time = time.time() - epoch_start
-
-        # Store history
-        history["train_loss"].append(train_metrics["loss"])
-        history["val_loss"].append(val_metrics["loss"])
-        history["train_roc_auc"].append(train_metrics["roc_auc"])
-        history["val_roc_auc"].append(val_metrics["roc_auc"])
-        history["train_pr_auc"].append(train_metrics["pr_auc"])
-        history["val_pr_auc"].append(val_metrics["pr_auc"])
-        history["train_precision"].append(train_metrics["precision"])
-        history["val_precision"].append(val_metrics["precision"])
-        history["train_recall"].append(train_metrics["recall"])
-        history["val_recall"].append(val_metrics["recall"])
-        history["train_f1"].append(train_metrics["f1"])
-        history["val_f1"].append(val_metrics["f1"])
-        history["train_f2"].append(train_metrics["f2"])
-        history["val_f2"].append(val_metrics["f2"])
-        history["lr"].append(current_lr)
-        history["epoch_time_sec"].append(epoch_time)
-
-        # Progress print
-        print(f"\nEpoch {epoch}/{num_epochs}")
-        print(
-            f"train_loss={train_metrics['loss']:.4f}  "
-            f"val_loss={val_metrics['loss']:.4f}"
-        )
-        print(
-            f"train_pr_auc={train_metrics['pr_auc']:.4f}  "
-            f"val_pr_auc={val_metrics['pr_auc']:.4f}"
-        )
-        print(
-            f"train_roc_auc={train_metrics['roc_auc']:.4f}  "
-            f"val_roc_auc={val_metrics['roc_auc']:.4f}"
-        )
-        print(
-            f"train_f1={train_metrics['f1']:.4f}  "
-            f"val_f1={val_metrics['f1']:.4f}"
-        )
-        print(
-            f"train_f2={train_metrics['f2']:.4f}  "
-            f"val_f2={val_metrics['f2']:.4f}"
-        )
-        print(
-            f"train_recall={train_metrics['recall']:.4f}  "
-            f"val_recall={val_metrics['recall']:.4f}"
-        )
-        print(
-            f"train_acc={train_metrics['accuracy']:.4f}  "
-            f"val_acc={val_metrics['accuracy']:.4f}"
-        )
+        print(f"\nEpoch {epoch + 1}/{num_epochs}")
+        print(f"train_loss={train_metrics['loss']:.4f}  val_loss={val_metrics['loss']:.4f}")
+        print(f"train_pr_auc={train_metrics['pr_auc']:.4f}  val_pr_auc={val_metrics['pr_auc']:.4f}")
+        print(f"train_roc_auc={train_metrics['roc_auc']:.4f}  val_roc_auc={val_metrics['roc_auc']:.4f}")
+        print(f"train_recall={train_metrics['recall']:.4f}  val_recall={val_metrics['recall']:.4f}")
+        print(f"train_f1={train_metrics['f1']:.4f}  val_f1={val_metrics['f1']:.4f}")
+        print(f"train_f2={train_metrics['f2']:.4f}  val_f2={val_metrics['f2']:.4f}")
+        print(f"train_acc={train_metrics['accuracy']:.4f}  val_acc={val_metrics['accuracy']:.4f}")
         print(f"lr={current_lr:.6f}  epoch_time={epoch_time:.2f}s")
 
+        improved = (
+            current_monitor_value > best_metric
+            if monitor_mode == "max"
+            else current_monitor_value < best_metric
+        )
 
-        if _is_improved(current_monitor_value, best_metric, monitor_mode):
+        if improved:
             best_metric = current_monitor_value
-            best_epoch = epoch
-            epochs_without_improvement = 0
+            best_epoch = epoch + 1
+            epochs_since_improvement = 0
 
-            best_path = checkpoint_dir / "best.pt"
             save_checkpoint(
-                checkpoint_path=str(best_path),
+                checkpoint_path=checkpoint_dir / "best.pt",
                 model=model,
                 optimizer=optimizer,
                 scheduler=scheduler,
-                epoch=epoch,
-                history=history,
+                criterion=criterion,
+                epoch=epoch + 1,
                 best_metric=best_metric,
+                history=history,
                 extra=extra_checkpoint_info,
             )
-            print(f"[checkpoint] Saved new best model -> {best_path}")
+            print(f"[checkpoint] Saved new best model -> {checkpoint_dir / 'best.pt'}")
         else:
-            epochs_without_improvement += 1
+            epochs_since_improvement += 1
 
-        if save_last:
-            last_path = checkpoint_dir / "last.pt"
-            save_checkpoint(
-                checkpoint_path=str(last_path),
-                model=model,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                epoch=epoch,
-                history=history,
-                best_metric=best_metric,
-                extra=extra_checkpoint_info,
-            )
-
-        metric_key = monitor.split("_", 1)[1]
-
+        metric_key = monitor.split("_", 1)[1] if "_" in monitor else monitor
         _maybe_print_overfitting_warning(
             history=history,
             metric_name=metric_key,
@@ -502,11 +499,8 @@ def train_model(
             gap_threshold=0.10,
         )
 
-        if early_stopping_patience is not None and epochs_without_improvement >= early_stopping_patience:
-            print(
-                f"[early stopping] No improvement in {monitor} for "
-                f"{epochs_without_improvement} epochs. Stopping."
-            )
+        if early_stopping_patience is not None and epochs_since_improvement >= early_stopping_patience:
+            print(f"[early stopping] No improvement in {monitor} for {early_stopping_patience} epochs. Stopping.")
             break
 
     summary = {
@@ -516,11 +510,13 @@ def train_model(
         "checkpoint_dir": str(checkpoint_dir),
         "monitor": monitor,
         "monitor_mode": monitor_mode,
-        "run_config": extra_checkpoint_info
+        "run_config": extra_checkpoint_info or {},
+        "optimizer_class": optimizer.__class__.__name__,
+        "scheduler_class": scheduler.__class__.__name__ if scheduler is not None else None,
+        "criterion_class": criterion.__class__.__name__,
     }
 
-    summary_path = checkpoint_dir / "training_summary.json"
-    with open(summary_path, "w", encoding="utf-8") as f:
+    with open(checkpoint_dir / "training_summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
 
     print(f"\nTraining complete. Best {monitor}={best_metric:.4f} at epoch {best_epoch}")
