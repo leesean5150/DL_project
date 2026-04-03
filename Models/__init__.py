@@ -1,9 +1,5 @@
-from .FraudModel import TransformerFraudModel, LastTokenMLP
-from .AutoEncoder import AutoEncoder, GatedAutoEncoder
+from .AutoEncoder import AutoEncoder
 
 __all__ = {
-    "TransformerFraudModel",
-    "LastTokenMLP",
-    "AutoEncoder",
-    "GatedAutoEncoder"
+    "AutoEncoder"
 }
