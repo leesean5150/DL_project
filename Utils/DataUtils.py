@@ -8,6 +8,7 @@ from torch.utils.data import Dataset
 
 
 PREPROCESSED_DIRECTORY_PATH = "data/processed_fraud"
+PREPROCESSED_NORM_DIRECTORY_PATH = "data/processed_fraud_normalized"
 
 
 class BaseFraudDataset(Dataset):
