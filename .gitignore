@@ -213,5 +213,6 @@ data/ieee_fraud_sequences_full_embeddings.jsonl.zip
 data/processed_fraud
 data/processed_fraud_normalized
 data/*.csv
+data/*.zip
 checkpoints/*
 !checkpoints/.gitkeep
