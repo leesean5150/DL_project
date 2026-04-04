@@ -39,10 +39,15 @@ class FraudAEDataset(Dataset):
             X.to_numpy(dtype=np.float32, copy=True),
             dtype=dtype
         )
+        self.x_shape = self.X.shape
+        
 
         self.y = None
+        self.y_shape = None
+
         if y is not None:
             self.y = torch.tensor(y.to_numpy(copy=True), dtype=torch.float32)
+            self.y_shape = self.y.shape
 
         self.return_labels = return_labels
 
@@ -68,13 +73,11 @@ def build_ae_datasets(
     test_split=0.1,
     random_state=42,
 ):
-    train_df, _ = load_data()  # ignore Kaggle test for now
+    train_df, _ = load_data()  # ignore Kaggle test for now (maybe we use later for random bootstrapping)
 
     X, y = preprocess(train_df, mode=mode)
 
-    # -----------------------------
-    # First split → train vs temp
-    # -----------------------------
+
     X_train, X_temp, y_train, y_temp = train_test_split(
         X,
         y,
