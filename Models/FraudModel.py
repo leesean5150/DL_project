@@ -66,6 +66,7 @@ class FraudMLP(nn.Module):
         use_norm: bool = True,
         encoder: Optional[AutoEncoder] = None,
         freeze_encoder: bool = False,
+        use_recon_error_vector: bool = False,  # backward-compatible default (So our ipynb's don't break)
     ):
         super().__init__()
 
@@ -74,6 +75,8 @@ class FraudMLP(nn.Module):
 
         self.encoder = encoder
         self.freeze_encoder = freeze_encoder
+        self.use_recon_error_vector = use_recon_error_vector
+        self.input_dim = input_dim
 
         if self.encoder is not None and self.freeze_encoder:
             for param in self.encoder.parameters():
@@ -83,8 +86,12 @@ class FraudMLP(nn.Module):
         if self.encoder is None:
             prev_dim = input_dim
         else:
-            prev_dim = input_dim + self.encoder.latent_dim + 1
-            # prev_dim = input_dim + 1
+            if self.use_recon_error_vector:
+                # raw x + latent z + full reconstruction error vector
+                prev_dim = input_dim + self.encoder.latent_dim + input_dim
+            else:
+                # raw x + latent z + scalar reconstruction error
+                prev_dim = input_dim + self.encoder.latent_dim + 1
 
         layers = []
         for h in hidden_dims:
@@ -111,20 +118,40 @@ class FraudMLP(nn.Module):
             "has_encoder": encoder is not None,
             "freeze_encoder": freeze_encoder,
             "encoder_latent_dim": getattr(encoder, "latent_dim", None),
+            "use_recon_error_vector": use_recon_error_vector,
         }
 
-    def forward(self, x):
+    def _get_encoder_features(self, x: torch.Tensor): # Our testing showed that this is not great...
+        """
+        Returns:
+            z: latent vector, shape [B, latent_dim]
+            err_feat:
+                - shape [B, 1] if use_recon_error_vector=False
+                - shape [B, input_dim] if use_recon_error_vector=True
+        """
+        z = self.encoder.encode(x)
+
+        if self.use_recon_error_vector:
+            if not hasattr(self.encoder, "reconstruction_error_vector"):
+                raise AttributeError(
+                    "Encoder is missing reconstruction_error_vector(x). "
+                    "Please add this method to AutoEncoder."
+                )
+            err_feat = self.encoder.reconstruction_error_vector(x)
+        else:
+            err_feat = self.encoder.reconstruction_error(x).unsqueeze(1)
+
+        return z, err_feat
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.encoder is not None:
             if self.freeze_encoder:
                 with torch.no_grad():
-                    z = self.encoder.encode(x)
-                    err = self.encoder.reconstruction_error(x).unsqueeze(1)
+                    z, err_feat = self._get_encoder_features(x)
             else:
-                z = self.encoder.encode(x)
-                err = self.encoder.reconstruction_error(x).unsqueeze(1)
+                z, err_feat = self._get_encoder_features(x)
 
-            x = torch.cat([x, z, err], dim=1)
-            # x = torch.cat([x, err], dim=1)
+            x = torch.cat([x, z, err_feat], dim=1)
 
         x = self.backbone(x)
         logits = self.head(x)

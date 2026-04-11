@@ -55,22 +55,30 @@ class AutoEncoder(nn.Module):
         return self.encoder(x)
 
     def reconstruct(self, x: torch.Tensor) -> torch.Tensor:
-        x_hat, _ = self.forward(x)
+        z = self.encoder(x)
+        x_hat = self.decoder(z)
         return x_hat
 
-    def reconstruction_error(
-        self,
-        x: torch.Tensor,
-        reduction: str = "mean",
-    ) -> torch.Tensor:
-        x_hat = self.reconstruct(x)
-        err = (x - x_hat) ** 2
+    def reconstruction_error_vector(self, x: torch.Tensor) -> torch.Tensor:
+        x_recon = self.reconstruct(x)
+        return (x - x_recon).pow(2)
 
-        if reduction == "none":
-            return err
-        if reduction == "mean":
-            return err.mean(dim=-1)
-        if reduction == "sum":
-            return err.sum(dim=-1)
+    def reconstruction_error(self, x: torch.Tensor) -> torch.Tensor:
+        return self.reconstruction_error_vector(x).mean(dim=1)
 
-        raise ValueError("reduction must be 'none', 'mean', or 'sum'")
+    # def reconstruction_error(
+    #     self,
+    #     x: torch.Tensor,
+    #     reduction: str = "mean",
+    # ) -> torch.Tensor:
+    #     x_hat = self.reconstruct(x)
+    #     err = (x - x_hat) ** 2
+
+    #     if reduction == "none":
+    #         return err
+    #     if reduction == "mean":
+    #         return err.mean(dim=-1)
+    #     if reduction == "sum":
+    #         return err.sum(dim=-1)
+
+    #     raise ValueError("reduction must be 'none', 'mean', or 'sum'")
