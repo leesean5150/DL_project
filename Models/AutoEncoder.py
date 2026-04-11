@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-DEFAULT_LATENT_DIM = 32
+DEFAULT_LATENT_DIM = 64
 DEFAULT_HIDDEN_DIMS = [256, 128]
 
 
