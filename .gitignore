@@ -205,3 +205,17 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+ieee-fraud-detection
+data/ieee_fraud_sequences_full_embeddings.jsonl
+data/ieee_fraud_sequences_full_embeddings.jsonl.zip
+.DS_Store
+data/processed_fraud
+data/processed_fraud_normalized
+data/*.csv
+data/*.zip
+
+!checkpoints/.gitkeep
+checkpoints/*
+TrainMLP_reconVec (Abandoned).ipynb
+testing.ipynb
