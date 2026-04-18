@@ -1,168 +1,147 @@
-import json
+from __future__ import annotations
+
+import sys
 from pathlib import Path
-from typing import Dict, Any, Optional
+
+project_root = Path().resolve().parent
+if str(project_root) not in sys.path:
+    sys.path.append(str(project_root))
+
+from typing import Optional, Tuple
 
 import numpy as np
+import pandas as pd
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
 
-PREPROCESSED_DIRECTORY_PATH = "data/processed_fraud" 
+from sklearn.model_selection import train_test_split
 
-class TransactionDataset(Dataset):
+from .Preprocess import load_data, preprocess
+
+
+class FraudAEDataset(Dataset):
+    """
+    PyTorch Dataset for autoencoder training on flat fraud features.
+
+    Returns:
+        x               if return_labels=False
+        (x, y)          if return_labels=True
+    """
+
     def __init__(
         self,
-        processed_dir: str,
-        seq_len: int = 8,
-        split: Optional[str] = None,   # "train", "test" and "val" sets (Use those strings as the maps of how to split). 
-        label_dtype: torch.dtype = torch.float32, # we preprocessed so everything should be using floats
-    ):
-        self.processed_dir = Path(processed_dir)
-        self.seq_len = seq_len
-        self.label_dtype = label_dtype
-        self.split = split
-
-        # Load our Metadata
-        with open(self.processed_dir / "metadata.json", "r", encoding="utf-8") as f:
-            self.metadata = json.load(f)
-
-        with open(self.processed_dir / "feature_keys.json", "r", encoding="utf-8") as f:
-            self.feature_keys = json.load(f)
-
-        with open(self.processed_dir / "uids.json", "r", encoding="utf-8") as f:
-            self.uids = json.load(f)
-
-        # Load arrays
-        self.features = np.load(self.processed_dir / "features.npy", mmap_mode="r")
-        self.labels = np.load(self.processed_dir / "labels.npy", mmap_mode="r")
-        self.seq_lengths = np.load(self.processed_dir / "seq_lengths.npy", mmap_mode="r")
-
-        self.num_transactions = int(self.metadata["num_transactions"])
-        self.feature_dim = int(self.metadata["feature_dim"])
-        self.num_uids = int(self.metadata["num_uids"])
-
-        # Basic consistency checks
-        if self.features.shape != (self.num_transactions, self.feature_dim):
-            raise ValueError(
-                f"features.npy shape mismatch: expected {(self.num_transactions, self.feature_dim)}, "
-                f"got {self.features.shape}"
-            )
-
-        if self.labels.shape != (self.num_transactions,):
-            raise ValueError(
-                f"labels.npy shape mismatch: expected {(self.num_transactions,)}, got {self.labels.shape}"
-            )
-
-        if self.seq_lengths.shape != (self.num_uids,):
-            raise ValueError(
-                f"seq_lengths.npy shape mismatch: expected {(self.num_uids,)}, got {self.seq_lengths.shape}"
-            )
-
-        if len(self.uids) != self.num_uids:
-            raise ValueError(
-                f"uids.json length mismatch: expected {self.num_uids}, got {len(self.uids)}"
-            )
-
-        # Rebuild UID segments
-        # Example:
-        # seq_lengths = [1, 5, 1]
-        # uid_starts  = [0, 1, 6]
-        # uid_ends    = [1, 6, 7]   (exclusive)
-        self.uid_starts = np.cumsum(
-            np.concatenate([np.array([0], dtype=np.int64), self.seq_lengths[:-1]])
+        X: pd.DataFrame,
+        y: Optional[pd.Series] = None,
+        dtype: torch.dtype = torch.float32,
+        return_labels: bool = False,
+    ) -> None:
+        self.X = torch.tensor(
+            X.to_numpy(dtype=np.float32, copy=True),
+            dtype=dtype
         )
-        self.uid_ends = self.uid_starts + self.seq_lengths
+        self.x_shape = self.X.shape
+        
 
-        # Build sample indices for split
-        self.sample_indices = self._build_sample_indices(split)
+        self.y = None
+        self.y_shape = None
 
-    def _build_sample_indices(self, split: Optional[str]) -> np.ndarray:
-        if split is None:
-            return np.arange(self.num_transactions, dtype=np.int64)
+        if y is not None:
+            self.y = torch.tensor(y.to_numpy(copy=True), dtype=torch.float32)
+            self.y_shape = self.y.shape
 
-        split_map = {
-            "train": "train_uid_indices.npy",
-            "val": "val_uid_indices.npy",
-            "test": "test_uid_indices.npy",
-        }
+        self.return_labels = return_labels
 
-        if split not in split_map:
-            raise ValueError(f"split must be one of {list(split_map.keys())} or None, got {split}")
-
-        uid_indices = np.load(self.processed_dir / split_map[split])
-
-        txn_ranges = []
-        for uid_idx in uid_indices:
-            uid_idx = int(uid_idx)
-            start = int(self.uid_starts[uid_idx])
-            end = int(self.uid_ends[uid_idx])
-            txn_ranges.append(np.arange(start, end, dtype=np.int64))
-
-        if not txn_ranges:
-            return np.empty((0,), dtype=np.int64)
-
-        return np.concatenate(txn_ranges)
-
-    # Note:
-    # Splits are performed at the UID level to avoid leakage, but each transaction
-    # still becomes one training sample. Therefore dataset length is the number of
-    # transactions/windows in the selected split, not the number of UID sequences.
-    # A UID with T transactions contributes T rolling-window samples. Which is basically the same as the number of actual transactions:
-    # Example: Given a sequence S of 3 transactions: [T1, T2 , T3] we make a rollign window of:
-    # S_1 => [T1, T2, T3] 
-    # S_2 => [T2, T3]
-    # S_3 => [T3] 
-    # The number of sequences generated is equal to the number of transactions
     def __len__(self) -> int:
-        return len(self.sample_indices)
+        return len(self.X)
 
-    def _locate_uid_idx(self, global_txn_idx: int) -> int:
-        """
-        Find which UID segment contains this global transaction index.
-        uid_ends is exclusive, so searchsorted(..., side='right') works well.
-        """
-        return int(np.searchsorted(self.uid_ends, global_txn_idx, side="right"))
+    def __getitem__(self, idx: int):
+        x = self.X[idx]
 
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
-        if idx < 0 or idx >= len(self):
-            raise IndexError(f"Index {idx} out of range for dataset of size {len(self)}")
+        if self.return_labels and self.y is not None:
+            return x, self.y[idx]
 
-        # Map split-local sample index -> original global transaction index
-        global_txn_idx = int(self.sample_indices[idx])
+        return x
 
-        # Find owning UID segment
-        uid_idx = self._locate_uid_idx(global_txn_idx)
-        uid = self.uids[uid_idx]
 
-        seq_start = int(self.uid_starts[uid_idx])
-        seq_end = int(self.uid_ends[uid_idx])  # exclusive, not used directly here
 
-        # Build rolling history window ending at global_txn_idx
-        window_start = max(seq_start, global_txn_idx - self.seq_len + 1)
-        window_end = global_txn_idx + 1
 
-        window = self.features[window_start:window_end]  # shape [L, F]
-        actual_len = window.shape[0]
-        pad_len = self.seq_len - actual_len
+def build_ae_datasets(
+    mode="ae",
+    train_only_nonfraud=True,
+    return_labels=True,
+    val_split=0.1,
+    test_split=0.1,
+    random_state=42,
+):
+    train_df, _ = load_data()  # ignore Kaggle test for now (maybe we use later for random bootstrapping)
 
-        if actual_len <= 0:
-            raise ValueError(
-                f"Empty window encountered for idx={idx}, global_txn_idx={global_txn_idx}, uid={uid}"
-            )
+    X, y = preprocess(train_df, mode=mode)
 
-        # Left pad with zeros (we left pad because we want the final value in the sequence to be the thing we predict)
-        # For example if we had a transaction sequence of 3 it would look like::
-        # S = [PAD, PAD, PAD, T1, T2, T3] <- this way T3 which is the thing we want to predict is the last value in the sequence
-        x = np.zeros((self.seq_len, self.feature_dim), dtype=np.float32)
-        x[pad_len:] = window
 
-        attention_mask = np.zeros((self.seq_len,), dtype=np.bool_)
-        attention_mask[pad_len:] = True
+    X_train, X_temp, y_train, y_temp = train_test_split(
+        X,
+        y,
+        test_size=val_split + test_split,
+        random_state=random_state,
+        stratify=y,
+    )
 
-        y = self.labels[global_txn_idx]
 
-        return {
-            "x": torch.from_numpy(x),
-            "attention_mask": torch.from_numpy(attention_mask),
-            "y": torch.tensor(y, dtype=self.label_dtype),
-            "uid": uid,
-        }
+    val_ratio = val_split / (val_split + test_split)
+
+    X_val, X_test, y_val, y_test = train_test_split(
+        X_temp,
+        y_temp,
+        test_size=(1 - val_ratio),
+        random_state=random_state,
+        stratify=y_temp,
+    )
+
+
+    if train_only_nonfraud:
+        mask = (y_train == 0)
+        X_train = X_train.loc[mask]
+        y_train = y_train.loc[mask]
+
+    X_train = X_train.reset_index(drop=True)
+    X_val = X_val.reset_index(drop=True)
+    X_test = X_test.reset_index(drop=True)
+
+    y_train = y_train.reset_index(drop=True)
+    y_val = y_val.reset_index(drop=True)
+    y_test = y_test.reset_index(drop=True)
+
+
+    train_ds = FraudAEDataset(X_train, y_train, return_labels=return_labels)
+    val_ds = FraudAEDataset(X_val, y_val, return_labels=return_labels)
+    test_ds = FraudAEDataset(X_test, y_test, return_labels=return_labels)
+
+    input_dim = X_train.shape[1]
+
+    print(f"[INFO] Train: {X_train.shape}")
+    print(f"[INFO] Val: {X_val.shape}")
+    print(f"[INFO] Test: {X_test.shape}")
+
+    return train_ds, val_ds, test_ds, input_dim
+
+
+def build_ae_dataloaders(
+    batch_size: int = 256,
+    mode: str = "ae",
+    train_only_nonfraud: bool = False,
+    return_labels: bool = True,
+    val_split: float = 0.1,
+    num_workers: int = 0,
+):
+    train_ds, val_ds, test_ds, input_dim = build_ae_datasets(
+        mode=mode,
+        train_only_nonfraud=train_only_nonfraud,
+        return_labels=return_labels,
+        val_split=val_split,
+    )
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False) if val_ds else None
+    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
+
+    return train_loader, val_loader, test_loader, input_dim
